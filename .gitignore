@@ -102,3 +102,23 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# local modifications
+\#*\#
+*~
+*mp4
+*MP4
+*LRV
+*apple
+*gz
+*xml
+*m4a
+*orig
+*backup
+*txt
+*json
+*before_cut
+*h264
+*raw
+*msg
+*aac
