@@ -1,5 +1,6 @@
 """
 Usage: recon1.py <start> <header2> <stop>
+
 """
 
 
@@ -16,6 +17,10 @@ from tqdm import tqdm
 from pathlib import Path
 
 cluster_size = 256*512
+
+commands = docopt(__doc__)
+# print(commands)
+# sys.exit(1)
 
 
 def get_frame_nr(filename):
@@ -37,12 +42,13 @@ def get_frame_nr(filename):
 # stop = 540748+2
 
 
-commands = docopt(__doc__)
 header1 = 0
 start = int(commands['<start>'])
 header2 = int(commands['<header2>'])-start
 stop = int(commands['<stop>'])
 
+moov1_cluster_length = int(commands['--m1'])
+moov2_cluster_length = int(commands['--m2'])
 
 with open('/sdimage-p1.img', 'rb') as f:
     # f.seek(cluster_size*855)
@@ -65,11 +71,12 @@ def save_used(used, filename='used.json'):
 assert mybytes[:len(header)] == header, 'Wrong first header'
 assert mybytes[header2*cluster_size:header2*cluster_size+len(header)] == header, 'Wrong second header'
 
-mdat1 = int.from_bytes(mybytes[20:24], byteorder='big') // cluster_size
-mdat2 = int.from_bytes(mybytes[header2*cluster_size+20:header2 *
-                               cluster_size+24], byteorder='big') // cluster_size
+mdat1 = (int.from_bytes(mybytes[20:24], byteorder='big')+20) // cluster_size
+mdat2 = (int.from_bytes(mybytes[header2*cluster_size+20:header2
+                                * cluster_size+24], byteorder='big')+20) // cluster_size
 
 print('mdat', mdat1, mdat2)
+
 # find moov+mvhd positions
 pos = 0
 moov1 = None
@@ -116,18 +123,19 @@ with open('reconstructed01.MP4', 'wb') as out1:
     used[0] = -1
     for i in range(mdat1-header2+4):
         out1.write(zero_cluster)
-    out1.write(mybytes[moov1*cluster_size:(moov1+1)*cluster_size])
-    used[moov1] = -2
+    out1.write(mybytes[moov1*cluster_size:(moov1+moov1_cluster_length)*cluster_size])
+    used[moov1:moov1+moov1_cluster_length] = -2
+
 with open('reconstructed01.LRV', 'wb') as out2:
     out2.write(mybytes[header2*cluster_size:(header2+4)*cluster_size])
     used[header2:header2+1] = 1
     used[header2+1:header2+4] = 3
     # this is just a guess
-    used[header2+5] = -3
+    #used[header2+4] = -3
     for i in range(mdat2-4):
         out2.write(zero_cluster)
-    out2.write(mybytes[moov2*cluster_size:(moov2+2)*cluster_size])
-    used[moov2:moov2+2] = 2
+    out2.write(mybytes[moov2*cluster_size:(moov2+moov2_cluster_length+1)*cluster_size])
+    used[moov2:moov2+moov2_cluster_length+1] = 2
 
 LRV_old = Path('reconstructed01.LRV_orig')
 LRV = Path('reconstructed01.LRV')
@@ -200,27 +208,41 @@ def check_sound(filename):
 
 last = 0
 with tqdm(total=len(used), file=sys.stdout) as pbar:
-    go = True
-    while go:
+    while True:
         out = Counter(used)
-        pbar.set_description(f'testing clusters {out[3]:3d}')
+        pbar.set_description(f'testing clusters: found->{out[3]:3d}')
+        if pos > 350 and out[3] < 4:
+            print('giving up.')
+            sys.exit(1)
+
         max_frame_old = get_frame_nr('reconstructed01.LRV')
         sound_old = 0  # check_sound('reconstructed01.LRV')
+        # last position
         pos = find_pos(used)
         pbar.update(pos-last)
-        # try with new pos included and not
-        test1 = used[:]
+        # are we done?
         if pos+1 == len(used):
             break
         if used[pos+1] == 2:
             print('would overwrite a 2, breaking')
             break
-        test1[pos+1] = 3
+        # try with new group of 4 at pos included and not
+        test1 = used.copy()
+        missing = min(mdat2 - out[1]-out[3], 4)
+        # add a new group of 4 (or less towards the end)
+        new_pos = []
+        for k in range(missing):
+            if used[pos+1+k] != 0:
+                print(f'would overwrite a used block, skipping... value {used[pos+1+k]} position {pos+1+k}')
+            else:
+                test1[pos+1+k] = 3
+                new_pos.append(pos+1+k)
         good = make_video(test1)
         max_frame = get_frame_nr('reconstructed01.LRV')
         sound = 0  # check_sound('reconstructed01.LRV')
         if max_frame > max_frame_old:  # or sound > sound_old:
-            used[pos+1] = 3
+            for n in new_pos:
+                used[n] = 3
             # print(f'pos {pos+1} is good', sound, max_frame)
         else:
             used[pos+1] = -3
