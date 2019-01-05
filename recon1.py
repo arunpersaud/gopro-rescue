@@ -1,5 +1,5 @@
 """
-Usage: recon1.py <start> <header2> <stop>
+Usage: recon1.py <start> <stop>
 
 """
 
@@ -37,28 +37,6 @@ def get_frame_nr(filename):
                 frames.append(frame)
     return len(frames)
 
-# tahoe video
-# start = 540443
-# stop = 540748+2
-
-
-header1 = 0
-start = int(commands['<start>'])
-header2 = int(commands['<header2>'])-start
-stop = int(commands['<stop>'])
-
-moov1_cluster_length = int(commands['--m1'])
-moov2_cluster_length = int(commands['--m2'])
-
-with open('/sdimage-p1.img', 'rb') as f:
-    # f.seek(cluster_size*855)
-    # mybytes = f.read((2058-855)*cluster_size)
-    f.seek(cluster_size*start)
-    mybytes = f.read((stop-start)*cluster_size)
-
-header = b'\x00\x00\x00\x14\x66\x74\x79\x70\x6d\x70\x34\x31\x20\x13\x10\x18'
-zero_cluster = b'\x00'*cluster_size
-
 
 def save_used(used, filename='used.json'):
     """Save all information used to reconstruct movie"""
@@ -68,84 +46,128 @@ def save_used(used, filename='used.json'):
         json.dump(data, f)
 
 
+# tahoe video
+# start = 540443
+# stop = 540748+2
+
+start = int(commands['<start>'])
+stop = int(commands['<stop>'])
+
+with open('/sdimage-p1.img', 'rb') as f:
+    f.seek(cluster_size*start)
+    mybytes = f.read((stop-start)*cluster_size)
+
+header = b'\x00\x00\x00\x14\x66\x74\x79\x70\x6d\x70\x34\x31\x20\x13\x10\x18'
+zero_cluster = b'\x00'*cluster_size
+
+# find headers
+header1 = 0
 assert mybytes[:len(header)] == header, 'Wrong first header'
+
+header2 = mybytes.find(header, cluster_size) // cluster_size
+# should be at beginning of cluster
 assert mybytes[header2*cluster_size:header2*cluster_size+len(header)] == header, 'Wrong second header'
 
-mdat1 = (int.from_bytes(mybytes[20:24], byteorder='big')+20) // cluster_size
-mdat2 = (int.from_bytes(mybytes[header2*cluster_size+20:header2
-                                * cluster_size+24], byteorder='big')+20) // cluster_size
+print(f'header positions:     {header1} {header2}')
 
-print('mdat', mdat1, mdat2)
+# get mdat information
+mdat1_length = int.from_bytes(mybytes[20:24], byteorder='big')
+mdat2_length = int.from_bytes(mybytes[header2*cluster_size+20:header2*cluster_size+24], byteorder='big')
 
-# find moov+mvhd positions
-pos = 0
-moov1 = None
-moov2 = None
+# how many clusters is mdat long
+mdat1_cluster_length = (mdat1_length+20) // cluster_size
+mdat2_cluster_length = (mdat2_length+20) // cluster_size
 
-while True:
-    pos = mybytes.find(b'moov', pos+1)
-    if pos == -1:
-        break
-    if moov1:
-        moov2 = pos
-    else:
-        moov1 = pos
-    # print(mybytes[pos+8:pos+12])
+print('mdat cluster lengths:', mdat1_cluster_length, mdat2_cluster_length)
 
-print(moov1, moov2)
-a = moov1 % cluster_size
+# find moov+mvhd positions that fits with mdat
+subsections = [b'mvhd', b'udta', b'iods', b'trak', b'trak', b'trak', b'trak', b'trak']
 
-assert moov1 % cluster_size < cluster_size - \
-    10, f"moov1 near end of cluster {a} < {cluster_size}"
-assert moov2 % cluster_size < cluster_size - 10, "moov2 near end of cluster"
 
-assert moov1 % cluster_size > 5, "moov1 near start of cluster"
-assert moov2 % cluster_size > 5, "moov2 near start of cluster"
+def find_moov(mdat_length, ignore=None):
+    offset = (mdat_length + 20 + 4) % cluster_size
+    if offset >= cluster_size - 4:
+        print('Error: moov at end of cluster')
+        sys.exit(1)
+    moov = []
+    for i in range(stop-start):
+        if mybytes[i*cluster_size+offset:i*cluster_size+4+offset] == b'moov':
+            if not moov:
+                moov.append(i)
+                break
+    assert len(moov) == 1, 'Could not find a moov'
+    offset = (mdat_length + 20) % cluster_size
+    moov_offset = offset
+    moov_length = int.from_bytes(mybytes[offset+i*cluster_size:offset+4+i*cluster_size], byteorder='big')
 
-moov1_length = int.from_bytes(mybytes[moov1-4:moov1], byteorder='big')
-moov2_length = int.from_bytes(mybytes[moov2-4:moov2], byteorder='big')
+    if offset + moov_length > cluster_size:
+        #print('need to look at subsections')
+        pos = (offset+i*cluster_size+12) % cluster_size
+        cluster = i
+        for sec in subsections:
+            #print(f'looking for {sec} at {pos} at cluster {cluster}, stop at {stop}')
+            while mybytes[cluster*cluster_size+pos:cluster*cluster_size+4+pos] != sec:
+                cluster += 1
+                if cluster in ignore:
+                    continue
+                if cluster > stop:
+                    print('reached end')
+                    break
+            moov.append(cluster)
+            tmp = b''
+            for m in moov:
+                tmp += mybytes[m*cluster_size:(m+1)*cluster_size]
+            sec_length = int.from_bytes(tmp[pos-4-cluster_size:pos-cluster_size], byteorder='big')
+            assert tmp[pos-cluster_size:pos+4-cluster_size] == sec, 'incorrect section'
+            pos = (pos+sec_length) % cluster_size
+            # print(f'found sec with length {sec_length}, next pos {pos}')
+        # ensure all of moov in tmp
+        assert moov_offset+moov_length <= len(tmp), 'Very end of moov missing'
 
-print('test', moov2, moov2+moov2_length)
-print('test', moov2//cluster_size, (moov2+moov2_length)/cluster_size)
-moov1 = moov1//cluster_size
-moov2 = moov2//cluster_size
-print('moov loc', moov1, moov2)
-print('moov length', moov1_length, moov2_length)
-print('moov length', moov1_length//cluster_size, moov2_length//cluster_size)
+    moov = sorted(list(set(moov)))
+    return moov, moov_length
+
+
+moov1, moov1_length = find_moov(mdat1_length, [])
+print('moov1:', moov1)
+print('moov1 length', moov1_length)
+moov2, moov2_length = find_moov(mdat2_length, ignore=moov1)
+print('moov2:', moov2)
+print('moov1 length', moov2_length)
 
 # create array to mark which blocks have been used
 
 used = np.array([0] * (len(mybytes)//cluster_size+20))
 
 with open('reconstructed01.MP4', 'wb') as out1:
-    out1.write(mybytes[:(header2-4)*cluster_size])
+    out1.write(mybytes[:header2*cluster_size])
     used[:header2] = -3
     used[0] = -1
-    for i in range(mdat1-header2+4):
+    for i in range(mdat1_cluster_length-header2):
         out1.write(zero_cluster)
-    out1.write(mybytes[moov1*cluster_size:(moov1+moov1_cluster_length)*cluster_size])
-    used[moov1:moov1+moov1_cluster_length] = -2
+    for m in moov1:
+        out1.write(mybytes[m*cluster_size:(m+1)*cluster_size])
+        used[m] = -2
 
 with open('reconstructed01.LRV', 'wb') as out2:
     out2.write(mybytes[header2*cluster_size:(header2+4)*cluster_size])
     used[header2:header2+1] = 1
-    used[header2+1:header2+4] = 3
+    used[header2+1:header2+3] = 3
     # this is just a guess
     #used[header2+4] = -3
-    for i in range(mdat2-4):
+    for i in range(mdat2_cluster_length-3):
         out2.write(zero_cluster)
-    out2.write(mybytes[moov2*cluster_size:(moov2+moov2_cluster_length+1)*cluster_size])
-    used[moov2:moov2+moov2_cluster_length+1] = 2
+    for m in moov2:
+        out2.write(mybytes[m*cluster_size:(m+1)*cluster_size])
+        used[m] = 2
 
 LRV_old = Path('reconstructed01.LRV_orig')
 LRV = Path('reconstructed01.LRV')
 shutil.copyfile(LRV, LRV_old)
 
 out = Counter(used)
-assert out[2] <= mdat2-1, f'wrong amount of 2 packages {out[2]} instead of 49'
 
 save_used(used, 'used-orig.json')
-print(mdat2)
 
 
 def make_video(used):
@@ -160,7 +182,7 @@ def make_video(used):
                 out2.write(mybytes[i*cluster_size:(i+1)*cluster_size])
                 c += 1
             if k == 2:
-                for j in range(mdat2-c):
+                for j in range(mdat2_cluster_length-c):
                     out2.write(zero_cluster)
                 out2.write(mybytes[i*cluster_size:(i+2)*cluster_size])
                 break
@@ -206,11 +228,13 @@ def check_sound(filename):
 # sys.exit(0)
 
 
+pos = 0
 last = 0
+max_frame_old = 0
 with tqdm(total=len(used), file=sys.stdout) as pbar:
     while True:
         out = Counter(used)
-        pbar.set_description(f'testing clusters: found->{out[3]:3d}')
+        pbar.set_description(f'testing clusters: found->{out[3]:3d}, #fn {max_frame_old}')
         if pos > 350 and out[3] < 4:
             print('giving up.')
             sys.exit(1)
@@ -228,7 +252,7 @@ with tqdm(total=len(used), file=sys.stdout) as pbar:
             break
         # try with new group of 4 at pos included and not
         test1 = used.copy()
-        missing = min(mdat2 - out[1]-out[3], 4)
+        missing = min(mdat2_cluster_length - out[1]-out[3], 4)
         # add a new group of 4 (or less towards the end)
         new_pos = []
         for k in range(missing):
@@ -241,8 +265,18 @@ with tqdm(total=len(used), file=sys.stdout) as pbar:
         max_frame = get_frame_nr('reconstructed01.LRV')
         sound = 0  # check_sound('reconstructed01.LRV')
         if max_frame > max_frame_old:  # or sound > sound_old:
+            # used[pos+1] = 3
+            # find length of current run
+            l = 0
+            n = pos
+            while used[n] > 0:
+                n -= 1
+                l += 1
+            # copy new position, but don't make a run longer than 4
             for n in new_pos:
-                used[n] = 3
+                if l < 4:
+                    used[n] = 3
+                    l += 1
             # print(f'pos {pos+1} is good', sound, max_frame)
         else:
             used[pos+1] = -3
