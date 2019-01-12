@@ -165,7 +165,6 @@ tmp = mybytes[header2*cluster_size:(header2+1)*cluster_size]
 frame_header = b'\x00\x00\x00\x02\t\x10\x00\x00\x00'
 offsets = [i['offset'] for i in idx]
 n_old = 0
-last_cluster = header2
 
 
 def last_frame(b):
@@ -181,6 +180,7 @@ def last_frame(b):
     return None
 
 
+last_cluster = header2
 while True:
     next_pos = last_frame(tmp)
     if next_pos is None:
@@ -193,6 +193,7 @@ while True:
         if cluster[p:p+len(frame_header)] == frame_header:
             tmp += cluster
             used[c] = 3
+            last_cluster = c
             break
     else:
         print('no cluster found')
