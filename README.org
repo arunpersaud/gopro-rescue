@@ -1,0 +1,276 @@
+* Reconstructing movies from a formatted SD card for a GoPro Hero 5
+
+Recently I managed somehow to format my GoPro SD card before I was
+able to copy the movies onto my hard drive. Since a quick format
+doesn't delete the content of the drive, just the lookup table, I
+thought there should be a way to reconstruct the movies. I ended up
+getting about 98% of the movies back. This repo documents part of what
+I did. The code here has some path hardcoded and will most likily not
+run as is, but perhaps it is helpful to some people.
+
+Just as a warning, I still don't really know much about file systems
+or video codecs, etc. so many things mentioned here might be
+incorrect, but it worked for me ;) ymmv
+
+I tried out quite a few different approaches, but will only go over
+what worked best for me in the end.
+
+** First step: create a backup image of the SD-card
+
+Since I already messed up the SD card once, I wanted to make a copy of
+the content onto my hard drive so that I have a backup, but also so
+that I can easily work with the data.
+
+I'm not sure what the exact command was, but on my linux machine I did
+something like the following after making sure that the SD-card was
+not mounted:
+
+#+BEGIN_SRC bash
+  dd if=/dev/mmcblk0p1 of=/sdimage-p1.img bs=4M
+#+END_SRC
+
+'dd' just copies the complete data into a file on disk. 'if' is the
+source, here the first and only partition on my SD-card, and 'of' is
+the file name of a file that will be created on disk.
+
+** Figure out what the cluster size is
+
+On the SD-card data gets written in packages of a certain size, the
+cluster size. If a file is smaller than this size, it still will use a
+whole cluster and if it is larger, then it will be split up into
+several packages and the location and order of these cluster get
+written into the File Allocation Table (FAT). This table gets
+overwritten in a quick format and since the packages could be either
+nicely ordered in time or completely random on the SD-card, it's in
+principle hard to reconstruct data from a formatted card.
+
+I found [[http://www.ntfs.com/exfat-boot-sector.htm][information about exFAT]] on the net which helped me figure out
+which bits to read to get to my cluster size, which normally is a
+multiple of 512 bytes and in my case was 256*512 bytes = 128 kiB.
+
+This also agreed with standard sizes for SD-cards that I found, for example,
+[[https://support.microsoft.com/en-us/help/140365/default-cluster-size-for-ntfs-fat-and-exfat][here]].
+
+** Standard layout of a MP4 file of the GoPro Hero5 Session
+
+The file standard of the MP4 file is described in ISO/IEC 14496-12 and
+ISO/IEC 14496-14. However, I only used a few parts of the standard and
+still don't understand the whole thing ;)
+
+The important parts for me where that each file is a binary file that
+has section of the following format:
+
+1) length of the section in 4 bytes
+2) 4 character name of the section,
+3) data (length -8 bytes)
+
+I checked old movies that I had from the GoPro and each and single one
+of them had 3 sections:
+
+1) ftyp (always 20 bytes long)
+2) mdat (variable length)
+3) moov (metadata, also variable length)
+
+This made it easy to search the image of the SD-card for clusters that
+start with an 'ftyp' record to figure out where movies started.
+
+The header to look for is:
+
+#+BEGIN_SRC python
+    header = b'\x00\x00\x00\x14\x66\x74\x79\x70\x6d\x70\x34\x31\x20\x13\x10\x18'
+#+END_SRC
+
+Since 'ftyp' is only 20 bytes long, the 'mdat' section always started
+in the same cluster of 128 kiB. The way to find the 'moov' cluster is
+to get the length of the 'mdat' section, add 20 for the 'ftyp' section
+and calculate the modulus in respect to the cluster size. Then go
+through all the clusters and look for a the characters 'moov' at an
+extra offset of 4 bytes (for the length of the 'moov' section).
+
+To read the length of the 'mdat' section one can do something like
+this in python:
+
+#+BEGIN_SRC python
+    mdat1_length = int.from_bytes(mybytes[20:24], byteorder='big')
+#+END_SRC
+
+if 'mybytes' holds the data of the current cluster.
+
+Unfortunately, sometime the 'moov' section consists of several
+clusters, in which case one needs to look a bit deeper. Luckily the
+'moov' section consists of subsections that follow the same structure
+(i.e. 4 bytes for the length and 4 bytes for a section name followed
+by the rest of the data for that section).
+
+Almost all of my movies had the following subsections inside a 'moov' section:
+
+1) 'mvhd'
+2) 'udta'
+3) 'iods'
+4)  5x 'trak'
+
+Some time laps movies that I made only had four 'trak'. I assume that the
+sound track is missing here.
+
+Using these subsection one can do the same trick again, e.g. calculate
+the position modules the cluster size and find a cluster that matches.
+
+** Layout of the clusters on the SD-card
+
+Overall I got lucky, since I normally quick format my SD-card *after*
+I copied the movies. This has the effect, I believe, that the card is
+empty and the clusters for the movies mostly get written in sequence
+on the SD-card.
+
+The problem is that the Hero5 with the settings I used always creates
+two movies, a small preview and a large 4k version. Since the data is
+created at the same time, the clusters for these two movies are
+written to the disk at the same time. This ended up with about 50-100
+clusters being written for the large movie and then four clusters being
+written for the small movie, then again a number of clusters for the
+high-res followed by another group of four clusters for the
+low-res. Luckily for the small movie it was always four clusters in a
+row. Once both movies were written to disk, a single cluster was used
+to store a thumbnail in form of a jpg. The jpg can be found by looking
+for clusters that start with
+
+#+BEGIN_SRC python
+    jpg_header = b'\xff\xd8\xff\xe0\x00\x10\x4a\x46\x49\x46\x00\x01\x01\x00\x00\x01'
+#+END_SRC
+
+Only for a few movies out of a ~100 was the layout on the SD-card
+different from the above and some of these I was lucky enough to be able to
+figure out, but some I lost.
+
+My strategy for reconstruction was therefore to find two movie headers
+followed by two clusters that include a 'moov' at the correct
+location, followed by a jpg image on the SD-card image. I then tried
+to organize just those clusters into the two movies (low-red and
+high-res).
+
+** Reading the 'moov' data
+
+For the following step I normally just focused on the low-res movie
+and assumed that all other clusters belong to the high-res one. This
+worked very well overall.
+
+The next step in the recovery was to create a file that has the
+correct length of the low-res movie, e.g. copy the first cluster of
+the movie to the beginning of a new file, then fill the file with
+clusters that contains just zeros (b'\x00'*cluster_size) and the
+'moov' section at the correct location and if the 'moov' section
+consists of multiple clusters, find those using the subsections and
+copy those out too. From the three main sections (ftyp, mdta,
+and moov) you know the size of the overall file and also the number of
+clusters for each section (and therefore the number of zeros you need
+to add). If the last 'trak' you found is not in the
+last cluster, I normally just tried to add the following cluster to
+the one that had the last 'trak' and that mostly worked.
+
+Now you have a file that will already play using for example 'mplayer'
+(it will mostly show carbage but it will be recognized as a movie
+file).
+
+At this point, I made use of some other software that I found: [[https://github.com/axiomatic-systems/Bento4][Bento4]].
+After downloading and compiling it, you have a few new programs on
+your computer that are very helpful. I relied on two:
+
+-  mp4dump:
+   This will just show you all the sections (e.g. mdta, moov) and
+   subsections, but doesn't rely on the mdat data being correct. So if
+   you run this over a reconstructed file you can see, if you got the
+   'moov' section correctly or not (best way is to compare all the
+   sections with the output from an existing movie that you might have
+   from your GoPro).
+
+** Complete reconstruction
+
+For the complete reconstruction of the low-res movie, we then can use
+a second program that is part of Bento4 and works on the just reconstructed
+file that has zeros in the 'mdat' section:
+
+-  mp4iframeindex:
+   This program will give you locations of, what I assume, are frames
+   within the 'mdat' data. The position is in reference to the absolute
+   beginning of the file.
+
+Looking at the data at these position in old GoPro movies, it turns
+out that all these sections start with the same binary signature.
+
+#+BEGIN_SRC python
+    frame_header = b'\x00\x00\x00\x02\t\x10\x00\x00\x00'
+#+END_SRC
+
+By using this information, we can now go through all the reported
+frameindex position and then go through all clusters, check
+if at the position modules the cluster size we have a frame header
+and only then add this to the output file.
+
+Using this, I managed to get most low-res movies reconstructed. Some
+had a few mdat frames that were larger than a cluster and for these I
+made use of the fact that I always seem to get group of 4 sequential
+clusters for the low-res movies.
+
+While creating the low-res movies, I also made a python list for all
+the clusters in this part of the SD-image and saved this in json
+file. The program could be restarted using this json file, which
+allowed me to do some hand editing on which clusters should be used.
+I also used this json file to then construct the high-res version from
+all the clusters that haven't been used for the low-res version.
+
+** Other helpful tools
+
+While trying to figure out how all of this worked, I also made a
+somewhat large Panda DataFrame that had a row for each cluster and in
+there marked, if this cluster contained the start of a movie, or a
+'moov' section. I also created md5-hashes of each cluster and stored
+this in the Panda 'database' (the file was saved as a [[https://msgpack.org/][msgpack]], which
+worked well for me). I then, for example, went over all my old GoPro
+movies, cut those into the 128 kiB cluster size and calculated
+md5-hashes on those and compared them with the database. This way I
+was actually able to find complete old movies, both high-res and
+low-res, on the SD-image. This was very helpful in figuring out that
+the low-res version always shows in up in groups of four clusters and
+that the low-res and high-res are sharing the same space.
+
+Whenever I reconstructed some movies (I did most of this more or less
+movie by movie, since the way I tried to reconstruct them changed
+several times) I also rerun the md5-hash and therefore could see how
+many clusters are already accounted for and how many can still be used
+to reconstruct unknown movies.
+
+** Files in this repo
+
+I don't have a single script that does all the work, and as mentioned
+at the beginning, the scripts might will most likely not run as they
+are partly because they will have some path hardcoded that need to be
+changed and other parts that need to be hand edited.
+
+| name                 | function                                                                            |
+|----------------------+-------------------------------------------------------------------------------------|
+| movie-test.py        | check the frameindex of a reconstructed file                                        |
+| check-md5-blocks.py  | test if we can find the md5 hashes of clusters in the panda DB                      |
+| mark_last_segment.py | calculate the md5 for the last cluster in a file where the data size < cluster size |
+| sanity-check.py      | similar to movie-test.py, checks if all the sections are where they should be       |
+| recon1.py            | reconstruct the low-res movies                                                      |
+| recon2.py            | later version of recon1.py                                                          |
+| remake               | reconstruct the high-res version from the json file of the low-res                  |
+| gopro-rescue         | several scripts to mostly handle the panda dataframe                                |
+
+Most reconstruction should work by running
+
+#+BEGIN_SRC bash
+    python3 recon2.py <start> <stop>
+#+END_SRC
+
+where 'start' and 'stop' are the cluster numbers in the SD-card image
+where a section starts and ends that contains the low- and high-res
+files.
+
+Sometimes one then needs to edit the json file to get the clusters
+right and then run
+
+#+BEGIN_SRC bash
+    remake <json file>  # recreates the Low-res version if needed
+    remake -i <json file>   # creates the high-res version
+#+END_SRC
