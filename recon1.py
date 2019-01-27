@@ -133,7 +133,7 @@ print('moov1:', moov1)
 print('moov1 length', moov1_length)
 moov2, moov2_length = find_moov(mdat2_length, ignore=moov1)
 print('moov2:', moov2)
-print('moov1 length', moov2_length)
+print('moov2 length', moov2_length)
 
 # create array to mark which blocks have been used
 
@@ -155,7 +155,7 @@ with open('reconstructed01.LRV', 'wb') as out2:
     used[header2+1:header2+3] = 3
     # this is just a guess
     #used[header2+4] = -3
-    for i in range(mdat2_cluster_length-3):
+    for i in range(mdat2_cluster_length-4):
         out2.write(zero_cluster)
     for m in moov2:
         out2.write(mybytes[m*cluster_size:(m+1)*cluster_size])
@@ -306,40 +306,3 @@ with open('reconstructed01.LRV', 'wb') as f:
     f.write(mybytes[:total])
 
 sys.stdout.flush()
-
-
-# MP4_old = Path('reconstructed01.MP4_orig')
-# MP4 = Path('reconstructed01.MP4')
-
-# try reconstructing one by one
-# while True:
-#    # first create backup
-#    shutil.copyfile(LRV, LRV_old)
-#    shutil.copyfile(MP4, MP4_old)
-#
-#    # find first unused blocks
-#    pos = np.argmin(used)
-#    if pos < 10:
-#        break
-#    data = mybytes[pos*cluster_size:(pos+1)*cluster_size]
-#
-#    # try adding it to the LRV movie
-#    with LRV.open('r+b') as f:
-#        block = f.read(cluster_size)
-#        while block != zero_cluster:
-#            block = f.read(cluster_size)
-#        f.seek(-cluster_size, 1)
-#        f.write(data)
-#    s = input(f'block {pos}: check LRV, is it better (y/n)?')
-#    if s == 'n':
-#        # undo change
-#        shutil.copyfile(LRV_old, LRV)
-#        # add to other file
-#        with MP4.open('r+b') as f:
-#            block = f.read(cluster_size)
-#            while block != zero_cluster:
-#                block = f.read(cluster_size)
-#            f.seek(-cluster_size, 1)
-#            f.write(data)
-#    used[pos] = True
-#
