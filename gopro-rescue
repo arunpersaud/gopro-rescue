@@ -1,0 +1,1021 @@
+#! /usr/bin/python3
+
+"""
+Usage:
+  gopro-rescue test <file>
+  gopro-rescue search <image>
+  gopro-rescue reconstruct <image>
+  gopro-rescue extract <image> <pos>
+  gopro-rescue cluster <image> <pos>
+  gopro-rescue subimage <image> <ranges>...
+  gopro-rescue moov <file>
+  gopro-rescue create_df <image>
+  gopro-rescue df_mark_zeros
+  gopro-rescue df_mark_jpg <image>
+  gopro-rescue df_mark_moov <image>
+  gopro-rescue df_mark_header <image>
+  gopro-rescue df_mark_old <image> <files>...
+"""
+
+import datetime
+from docopt import docopt
+import hashlib
+import json
+from multiprocessing import Pool
+from pathlib import Path
+import sys
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+
+commands = docopt(__doc__)
+# print(commands)
+
+chunk_size = 1024*1024
+cluster_size = 256*512
+
+DB_file = Path('cluster-db.msg')  # storage for panda dataframe
+CLUSTER_UNKOWN = -1
+CLUSTER_FINAL = -2
+CLUSTER_ZERO = -3
+CLUSTER_OLD = -4
+
+
+if DB_file.is_file():
+    DB = pd.read_msgpack(DB_file)
+    print('read cluster DB')
+else:
+    DB = None
+
+
+def save_single_file(f, pos):
+    """Extract a single movie (mp41) file from an image.
+
+    Start at an image file at position 'pos' and extract a movie
+    consisting of the header and a total of 3 package
+
+    """
+
+    total = 0
+    for i in range(3):
+        mybytes = f.read(4)
+        # print(mybytes)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+        # print(f'found package with length {package_length}')
+        f.seek(package_length-4, 1)
+        total += package_length
+        nr += 1
+
+
+def get_unused_file_number(directory):
+    N = 0
+    while True:
+        testfile = directory / f'rescued-{N:04d}.mp4'
+        if testfile.is_file():
+            N += 1
+        else:
+            return N
+
+
+def parse_mvhd(f, pos):
+    # mvhd
+    f.seek(pos, 0)
+    mybytes = f.read(4)
+    package_length = int.from_bytes(mybytes, byteorder='big')
+    mvhd_remaining = package_length-4
+    if pos % cluster_size > (pos+package_length) % cluster_size:
+        print('WARNING: mvhd going across cluster border')
+
+    name = f.read(4)
+    mvhd_remaining -= 4
+    if name != b'mvhd':
+        print('Error: wrong type (not mvhd)')
+        return None, None
+
+    version = int.from_bytes(f.read(1), byteorder='big')
+    mvhd_remaining -= 1
+
+    flags = f.read(3)
+    mvhd_remaining -= 3
+
+    timeoffset = datetime.datetime(1904, 1, 1).timestamp()
+    if version == 0:
+        mybytes = f.read(4)
+        creation_time = int.from_bytes(mybytes, byteorder='big')+timeoffset
+        mybytes = f.read(4)
+        modification_time = int.from_bytes(mybytes, byteorder='big')+timeoffset
+        mybytes = f.read(4)
+        timescale = int.from_bytes(mybytes, byteorder='big')
+        mybytes = f.read(4)
+        duration = int.from_bytes(mybytes, byteorder='big')/timescale
+        mvhd_remaining -= 16
+    else:
+        mybytes = f.read(8)
+        creation_time = int.from_bytes(mybytes, byteorder='big')+timeoffset
+        mybytes = f.read(8)
+        modification_time = int.from_bytes(mybytes, byteorder='big')+timeoffset
+        mybytes = f.read(4)
+        timescale = int.from_bytes(mybytes, byteorder='big')
+        mybytes = f.read(8)
+        duration = int.from_bytes(mybytes, byteorder='big')/timescale
+        mvhd_remaining -= 28
+    creation_time = datetime.datetime.fromtimestamp(creation_time)
+    modification_time = datetime.datetime.fromtimestamp(modification_time)
+
+    rate = int.from_bytes(f.read(4), byteorder='big') / (2**16)
+    volume = int.from_bytes(f.read(2), byteorder='big') / (2**8)
+    resevered = int.from_bytes(f.read(2), byteorder='big')
+    resevered = int.from_bytes(f.read(8), byteorder='big')
+    matrix = [int.from_bytes(f.read(4), byteorder='big') / (2**16) for x in range(9)]
+    pre_defined = [int.from_bytes(f.read(4), byteorder='big') for x in range(6)]
+    next_track_ID = int.from_bytes(f.read(4), byteorder='big')
+    mvhd_remaining -= 4+2+2+8+4*9+4*6+4
+    if mvhd_remaining != 0:
+        print('wrong length of mvhd')
+
+    return creation_time, duration
+
+
+def md5hex(args):
+    """calc md5 hashes of clusters, from start to end (including end)"""
+    myfile, start_cluster, end_cluster = args
+    out = dict()
+    pos = start_cluster
+    size = end_cluster-start_cluster
+    with tqdm(total=size, position=int(start_cluster/size+0.1)) as pbar:
+        pbar.set_description = f'calc hashes from {start_cluster}'
+        with open(myfile, 'rb') as f:
+            f.seek(start_cluster*cluster_size)
+            while pos <= end_cluster:
+                data = f.read(cluster_size)
+                out[pos] = hashlib.md5(data).hexdigest()
+                pos += 1
+                pbar.update()
+    return out
+
+
+if commands['test']:
+    # read single files and check how many packages are in there
+
+    myfile = Path(commands['<file>'])
+    if not myfile.is_file():
+        print('File does not exist')
+        sys.exit(1)
+    length = myfile.stat().st_size
+    total = 0
+    nr = 0
+    with open(myfile, 'rb') as f:
+        while length > total:
+            mybytes = f.read(4)
+            # print(mybytes)
+            package_length = int.from_bytes(mybytes, byteorder='big')
+            # print(f'found package with length {package_length}')
+            name = f.read(4)
+            print(name, package_length)
+            f.seek(package_length-8, 1)
+            total += package_length
+            nr += 1
+    if total == length:
+        status = '✓'
+    else:
+        status = 'bad'
+
+    print(myfile.name, length, total, nr, status)
+
+elif commands['create_df']:
+    cluster_ids = np.arange(980728)
+    DB = pd.DataFrame(index=cluster_ids)
+    DB['md5'] = None
+    DB['next'] = CLUSTER_UNKOWN
+    DB['start'] = False
+    print('save file')
+    DB.to_msgpack(DB_file)
+
+    myfile = Path(commands['<image>'])
+    if not myfile.is_file():
+        print('Image does not exist')
+        sys.exit(1)
+    size = myfile.stat().st_size
+
+    pos = 0
+    s = 0
+    with Pool(processes=4) as pool:
+        out = pool.map(md5hex, [[myfile, 0, 980727//4],
+                                [myfile, 980727//4 + 1, 980727//4 * 2],
+                                [myfile, 980727//4 * 2 + 1, 980727//4 * 3],
+                                [myfile, 980727//4 * 3 + 1, 980727], ])
+    for o in out:
+        DB.loc[o.keys(), 'md5'] = list(o.values())
+
+    print('save file')
+    print(DB)
+    out = DB.to_msgpack(DB_file)
+    print(out)
+
+elif commands['df_mark_zeros']:
+    zeros = b'\x00'*cluster_size
+    zero_md5 = hashlib.md5(zeros).hexdigest()
+    DB.loc[DB['md5'] == zero_md5, 'next'] = CLUSTER_ZERO
+    print('save DB file')
+    DB.to_msgpack(DB_file)
+
+elif commands['df_mark_jpg']:
+    myfile = Path(commands['<image>'])
+    if not myfile.is_file():
+        print('Image does not exist')
+        sys.exit(1)
+    size = myfile.stat().st_size
+
+    mp4 = b'\x00\x00\x00\x14\x66\x74\x79\x70\x6d\x70\x34\x31\x20\x13\x10\x18'
+    jpg = b'\xff\xd8\xff\xe0\x00\x10\x4a\x46\x49\x46\x00\x01\x01\x00\x00\x01'
+
+    DB['type'] = ''
+    with open(myfile, 'rb') as f:
+        for i in tqdm(range(980728)):
+            f.seek(i*cluster_size)
+            head = f.read(len(mp4))
+            if head == mp4:
+                DB.loc[i, 'type'] = 'movie'
+            elif head == jpg:
+                DB.loc[i, 'type'] = 'jpg'
+    print('save DB file')
+    DB.to_msgpack(DB_file)
+
+elif commands['df_mark_header']:
+    myfile = Path(commands['<image>'])
+    if not myfile.is_file():
+        print('Image does not exist')
+        sys.exit(1)
+    size = myfile.stat().st_size
+
+    header = b'\x00\x00\x00\x14\x66\x74\x79\x70\x6d\x70\x34\x31\x20\x13\x10\x18'
+    pos = 0
+
+    # also add column
+    DB['mdat_length'] = 0
+    with tqdm(total=980728) as pbar:
+        with myfile.open('rb') as f:
+            while pos < size//cluster_size:
+                f.seek(pos*cluster_size)
+                mybytes = f.read(len(header))
+                if mybytes == header:
+                    DB.loc[pos, 'start'] = True
+                    f.seek(pos*cluster_size+20)
+                    mybytes = f.read(4)
+                    package_length = int.from_bytes(mybytes, byteorder='big')
+                    DB.loc[pos, 'mdat_length'] = package_length
+                pos += 1
+                pbar.update()
+    print('save DB file')
+    DB.to_msgpack(DB_file)
+
+elif commands['df_mark_moov']:
+    myfile = Path(commands['<image>'])
+    if not myfile.is_file():
+        print('Image does not exist')
+        sys.exit(1)
+    size = myfile.stat().st_size
+
+    with open(myfile, 'rb') as f:
+        for i in tqdm(range(980728)):
+            f.seek(i*cluster_size)
+            mybytes = f.read(cluster_size)
+            pos = mybytes.find(b'moov')
+            try:
+                if pos > 0 and mybytes[pos+8:pos+12] == b'mvhd':
+                    DB.loc[i, 'type'] = 'moov'
+            except IndexError:
+                print(f'moov out of range at {i}')
+
+    print('save DB file')
+    DB.to_msgpack(DB_file)
+
+elif commands['df_mark_old']:
+    """Take and old files (or several) and mark the cluster blocks in the DB in case they are in there"""
+    if not 'used' in DB:
+        DB['used'] = ''
+    if not 'orig_cluster' in DB:
+        DB['orig_cluster'] = -1
+    tfound = 0
+    # create a dictionary of existing values for fast lookup (dict is faster than list)
+    known_md5 = {x: i for i, x in enumerate(DB['md5'].values)}
+    for f in tqdm(commands['<files>']):
+        myfile = Path(f)
+        if not myfile.is_file():
+            print('File missing')
+            sys.exit(2)
+        size = myfile.stat().st_size
+
+        pos = 0
+        found = 0
+        max_cluster = 0
+        with tqdm(total=size//cluster_size) as pbar:
+            with myfile.open('rb') as myf:
+                replace_idx = []
+                replace_with = []
+                while pos < size:
+                    pbar.set_description(f'{f} found {found}:')
+                    chunk = myf.read(cluster_size)
+                    pos += cluster_size
+
+                    mymd5 = hashlib.md5(chunk).hexdigest()
+
+                    if mymd5 in known_md5:
+                        found += 1
+                        tfound += 1
+                        replace_idx.append(known_md5[mymd5])
+                        replace_with.append([CLUSTER_OLD, str(myfile), pos//cluster_size])
+                    pbar.update(1)
+                if len(replace_with):
+                    DB.loc[replace_idx, ['next', 'used', 'orig_cluster']] = replace_with
+
+        # mark last cluster
+        length = size % cluster_size
+        last = size // cluster_size
+        if length == 0:
+            continue
+        with myfile.open('rb') as myf:
+            myf.seek(last*cluster_size)
+            data = myf.read(length)
+        c_id = max(replace_idx)
+        myimage = Path(commands['<image>'])
+        if not myimage.is_file():
+            print('Image does not exist')
+            sys.exit(1)
+        found = False
+        with myimage.open('rb') as IN:
+            for cluster_id in range(c_id-255, c_id+255):
+                IN.seek(cluster_id*cluster_size)
+                tmpdata = IN.read(length)
+                if tmpdata == data:
+                    if DB.loc[cluster_id, 'used'] == '':
+                        DB.loc[cluster_id, 'used'] = str(myfile)
+                        found = True
+        if not found:
+            print(myfile, 'cannot find last cluster')
+
+    print(f'found total of {tfound} clusters')
+    print('save DB file')
+    DB.to_msgpack(DB_file)
+
+# some code to do statistics on old files.
+#
+#In [103]: pos = 1
+#     ...: new = None
+#     ...: last_c = 546609-1
+#     ...: last_mp4 = 0
+#     ...: last_lrv = 0
+#     ...: for l in lines:
+#     ...:     c, f, fc = l.split()
+#     ...:     c = int(c.strip())
+#     ...:     f = f.strip()
+#     ...:     fc = int(fc.strip())
+#     ...:     if f.endswith('MP4'):
+#     ...:         new = 'MP4'
+#     ...:         if fc - last_mp4 != 1:
+#     ...:             print('mp4 discontinuity')
+#     ...:         last_mp4 = fc
+#     ...:     else:
+#     ...:         new = 'LRV'
+#     ...:         if fc - last_lrv != 1:
+#     ...:             print('lrv discontinuity')
+#     ...:         last_lrv = fc
+#     ...:     if new == last:
+#     ...:         pos += 1
+#     ...:     else:
+#     ...:         if new == 'LRV':
+#     ...:             MP4.append(pos)
+#     ...:         else:
+#     ...:             LRV.append(pos)
+#     ...:         pos = 1
+#     ...:     if c-last_c != 1:
+#     ...:         print('cluster discontinuity')
+#     ...:     last_c = c
+#     ...:     last = new
+#
+
+
+elif commands['search']:
+    # search through an image and find mp41 videos
+    myfile = Path(commands['<image>'])
+    if not myfile.is_file():
+        print('Image does not exist')
+        sys.exit(1)
+    size = myfile.stat().st_size
+
+    header = b'\x00\x00\x00\x14\x66\x74\x79\x70\x6d\x70\x34\x31\x20\x13\x10\x18'
+
+    last = b''
+    pos = 0
+    nr = 0
+    my_pos = []
+
+    backupfile = Path('gopro-rescue-positions.json')
+    if backupfile.is_file():
+        with backupfile.open('r') as f:
+            my_pos = json.load(f)
+            print('Found saved position, skipping search')
+            print(f'delete {backupfile.name} if you want to search again')
+    else:
+        with tqdm(total=size/chunk_size) as pbar:
+            with open(myfile, 'rb') as f:
+                while pos <= size:
+                    # we need to make sure that we search across the ends of chunks
+                    new = f.read(chunk_size)
+                    if pos == 0:
+                        to_search = new
+                    else:
+                        to_search = last[-len(header)+1:] + new
+                    found = to_search.find(header)
+                    if found >= 0:
+                        my_pos.append(found + pos)
+                        nr += 1
+                        # print(f'found movie at pos: {found_pos}')
+                        pbar.set_description(f'Found {nr} movies')
+                    last = new
+                    if pos == 0:
+                        pos += chunk_size - len(header) + 1
+                    else:
+                        pos += chunk_size
+                    pbar.update(1)
+                    # if nr > 10:
+                    #    break
+        print('Found positions at:')
+        print(my_pos)
+        with open('gopro-rescue-positions.json', 'w') as f:
+            json.dump(my_pos, f)
+
+    # now check that each of these has 3 packages
+    OK = 0
+    BAD = 0
+    with tqdm(total=nr) as pbar:
+        with open(myfile, 'rb') as f:
+            for pos in my_pos:
+                f.seek(pos, 0)
+                GOOD = True
+                length = 0
+
+                # first double check that we are at the correct location
+                h = f.read(len(header))
+                if not h == header:
+                    print('Wrong position')
+                    continue
+                else:
+                    print('correct', pos)
+                f.seek(pos, 0)
+
+                mybytes = f.read(4)
+                # print(mybytes)
+                package_length = int.from_bytes(mybytes, byteorder='big')
+
+                name = f.read(4)
+                if name != b'ftyp':
+                    print('Error: wrong type (not ftyp)')
+                    print(name, package_length)
+                    GOOD = False
+                f.seek(package_length-8, 1)
+                length += package_length
+
+                mybytes = f.read(4)
+                # print(mybytes)
+                package_length = int.from_bytes(mybytes, byteorder='big')
+
+                name = f.read(4)
+                if name != b'mdat':
+                    print('Error: wrong type (not mdat)')
+                    print(name, package_length)
+                    GOOD = False
+                f.seek(package_length-8, 1)
+                length += package_length
+
+                mybytes = f.read(4)
+                # print(mybytes)
+                package_length = int.from_bytes(mybytes, byteorder='big')
+
+                name = f.read(4)
+                if name != b'moov':
+                    print('Error: wrong type (not moov)')
+                    print(name, package_length)
+                    f.seek(-20, 1)
+                    data = f.read(40)
+                    print(data)
+                    f.seek(-20, 1)
+                    GOOD = False
+                f.seek(package_length-8, 1)
+                length += package_length
+
+                if GOOD:
+                    # go back and write out the file
+                    N = get_unused_file_number(Path('.'))
+                    new_file = Path(f'rescued-{N:04d}.mp4')
+                    if new_file.is_file():
+                        print('File exist, should not happen')
+                        sys.exit(1)
+
+                    # rewind
+                    f.seek(pos, 0)
+
+                    # write data
+                    with new_file.open('wb') as n:
+                        wrote = 0
+                        chunk = chunk_size
+                        keep_reading = True
+                        while keep_reading:
+                            to_read = length-wrote
+                            if to_read < chunk_size:
+                                chunk = to_read
+                                keep_reading = False
+                            data = f.read(chunk)
+                            n.write(data)
+                            wrote += len(data)
+                    print(f'Saved one file as {new_file.name}')
+                pbar.update(1)
+
+elif commands['reconstruct']:
+    # search through an image and find mp41 videos
+    myfile = Path(commands['<image>'])
+    if not myfile.is_file():
+        print('Image does not exist')
+        sys.exit(1)
+    size = myfile.stat().st_size
+
+    header = b'\x00\x00\x00\x14\x66\x74\x79\x70\x6d\x70\x34\x31\x20\x13\x10\x18'
+
+    chunk_size = 1024*1024
+    last = b''
+    pos = 0
+    nr = 0
+    my_header = []
+    my_ftyp = []
+    my_mdat = []
+    my_moov = []
+
+    # get position of header, ftyp, mdat, moov
+    backupfile = Path('gopro-rescue-positions2.json')
+    if backupfile.is_file():
+        with backupfile.open('r') as f:
+            my_header, my_ftyp, my_mdat, my_moov = json.load(f)
+            print('Found saved position, skipping search')
+            print(f'delete {backupfile.name} if you want to search again')
+    else:
+        with tqdm(total=size/chunk_size) as pbar:
+            with open(myfile, 'rb') as f:
+                while pos <= size:
+                    # we need to make sure that we search across the ends of chunks
+                    new = f.read(chunk_size)
+                    if pos == 0:
+                        to_search = new
+                    else:
+                        to_search = last[-len(header)+1:] + new
+                    found = to_search.find(header)
+                    if found >= 0:
+                        my_header.append(found + pos)
+                        nr += 1
+                        # print(f'found movie at pos: {found_pos}')
+                        pbar.set_description(f'Found {nr} movies')
+
+                    found = to_search.find(b'ftyp')
+                    if found >= 0:
+                        my_ftyp.append(found + pos)
+
+                    found = to_search.find(b'mdat')
+                    if found >= 0:
+                        my_mdat.append(found + pos)
+
+                    found = to_search.find(b'moov')
+                    if found >= 0:
+                        my_moov.append(found + pos)
+
+                    last = new
+                    if pos == 0:
+                        pos += chunk_size - len(header) + 1
+                    else:
+                        pos += chunk_size
+                    pbar.update(1)
+                    # if nr > 10:
+                    #    break
+        print('Found positions at:')
+        print([my_header, my_ftyp, my_mdat, my_moov])
+        with open('gopro-rescue-positions2.json', 'w') as f:
+            json.dump([my_header, my_ftyp, my_mdat, my_moov], f)
+
+    # now check positions of header
+    print(f'found {len(my_header)} headers')
+    for h in my_header:
+        if h % cluster_size != 0:
+            print('header not at beginning of cluster')
+
+    # check mdat
+    false_mdat = []
+    for d in my_mdat:
+        found = False
+        for h in my_header:
+            if h+24 == d:
+                found = True
+                break
+        if not found:
+            print(f'no associated header for mdat {d:x}')
+            false_mdat.append(d)
+    my_mdat = [x for x in my_mdat if x not in false_mdat]
+    with open('gopro-rescue-positions2.json', 'w') as f:
+        json.dump([my_header, my_ftyp, my_mdat, my_moov], f)
+
+    # find position where moov should be in cluster
+    cluster_moov_pos = [(x-4) % cluster_size for x in my_moov]
+    if len(cluster_moov_pos) == len(set(cluster_moov_pos)):
+        print('moov positions are unique')
+    else:
+        print(
+            f'moov positions are NOT unique: moov {len(cluster_moov_pos)}  cluster moov {len(set(cluster_moov_pos))}')
+    if min(cluster_moov_pos) < 10 or max(cluster_moov_pos) > cluster_size-10:
+        print('possible problem with moov across cluster border')
+    print('min/max of moov in cluster', min(cluster_moov_pos), max(cluster_moov_pos))
+    nr = 0
+    ok = 0
+    good_mdat = []
+    with open(myfile, 'rb') as f:
+        for d in my_mdat:
+            f.seek(d-4, 0)
+            mybytes = f.read(4)
+            mdat_length = int.from_bytes(mybytes, byteorder='big')
+            mybytes = f.read(4)
+            if not mybytes == b'mdat':
+                print('wrong position')
+            moov_pos = mdat_length+d-4
+            if moov_pos+4 in my_moov:
+                # print('found moov at correct location!')
+                ok += 1
+                good_mdat.append(d)
+            elif moov_pos % cluster_size in cluster_moov_pos:
+                # print('found moov at correct location in cluster!')
+                nr += 1
+                good_mdat.append(d)
+            else:
+                print('no moov found')
+        print(f'ok {ok} good {nr} moovs {len(my_moov)}')
+
+        print('-'*20)
+        bad_moov = []
+        holiday = 0
+        border = 0
+        for m in my_moov:
+            if m % cluster_size > cluster_size-10:
+                print('WARNING: moov going across cluster')
+                border += 1
+            ct, d = parse_mvhd(f, m+4)
+            if ct is None:
+                bad_moov.append(m)
+            elif ct > datetime.datetime(2018, 12, 15):
+                print('found holiday one', m, ct, d)
+                holiday += 1
+            else:
+                print(m, ct, d)
+        print(f'found {holiday} holiday moovs')
+        print(f'found {border} border issues moovs')
+    print('done')
+
+elif commands['extract']:
+    pos = int(commands['<pos>'])
+
+    myfile = Path(commands['<image>'])
+    if not myfile.is_file():
+        print('Image does not exist')
+        sys.exit(1)
+
+    N = get_unused_file_number(Path('.'))
+    new_file = Path(f'rescued-{N:04d}.mp4')
+    if new_file.is_file():
+        print('File exist, should not happen')
+        sys.exit(1)
+
+    with open(myfile, 'rb') as f:
+        f.seek(pos, 0)
+
+        # figure out length
+        length = 0
+        for i in range(3):
+            mybytes = f.read(4)
+            package_length = int.from_bytes(mybytes, byteorder='big')
+            f.seek(package_length-4, 1)
+            length += package_length
+
+        f.seek(pos, 0)
+        # write data
+        with new_file.open('wb') as n:
+            wrote = 0
+            chunk = chunk_size
+            keep_reading = True
+            while keep_reading:
+                to_read = length-wrote
+                if to_read < chunk_size:
+                    chunk = to_read
+                    keep_reading = False
+                data = f.read(chunk)
+                n.write(data)
+                wrote += len(data)
+        print(f'Saved one file as {new_file.name}')
+
+elif commands['cluster']:
+    pos = int(commands['<pos>'])
+
+    myfile = Path(commands['<image>'])
+    if not myfile.is_file():
+        print('Image does not exist')
+        sys.exit(1)
+
+    outfile = f'cluster-{pos:06d}.bin'
+
+    with open(myfile, 'rb') as f:
+        f.seek(pos*cluster_size, 0)
+        mybytes = f.read(cluster_size)
+    with open(outfile, 'wb') as f:
+        f.write(mybytes)
+    print(f'wrote cluster {pos}')
+
+elif commands['subimage']:
+    ranges = commands['<ranges>']
+
+    myfile = Path(commands['<image>'])
+    if not myfile.is_file():
+        print('Image does not exist')
+        sys.exit(1)
+
+    outfile = f'subimage.bin'
+
+    with open(myfile, 'rb') as IN:
+        with open(outfile, 'wb') as OUT:
+            for r in ranges:
+                start, stop = r.split('-')
+                start = int(start)
+                stop = int(stop)
+                print(f'copying {start}-{stop}')
+                for pos in range(start, stop+1):
+                    IN.seek(pos*cluster_size, 0)
+                    mybytes = IN.read(cluster_size)
+                    OUT.write(mybytes)
+    print(f'wrote new subimage')
+
+elif commands['moov']:
+    myfile = Path(commands['<file>'])
+    if not myfile.is_file():
+        print('Image does not exist')
+        sys.exit(1)
+
+    with open(myfile, 'rb') as f:
+        # ftyp - skip
+        mybytes = f.read(4)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+        f.seek(package_length-4, 1)
+
+        # mdat - skip
+        mybytes = f.read(4)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+        f.seek(package_length-4, 1)
+
+        # moov
+        mybytes = f.read(4)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+        moov_remaining = package_length-4
+
+        name = f.read(4)
+        moov_remaining -= 4
+        if name != b'moov':
+            print('Error: wrong type (not moov)')
+            sys.exit(1)
+
+        # mvhd
+        mybytes = f.read(4)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+        mvhd_remaining = package_length-4
+
+        name = f.read(4)
+        mvhd_remaining -= 4
+        if name != b'mvhd':
+            print('Error: wrong type (not mvhd)')
+            sys.exit(1)
+
+        version = int.from_bytes(f.read(1), byteorder='big')
+        mvhd_remaining -= 1
+
+        flags = f.read(3)
+        mvhd_remaining -= 3
+
+        timeoffset = datetime.datetime(1904, 1, 1).timestamp()
+        if version == 0:
+            mybytes = f.read(4)
+            creation_time = int.from_bytes(mybytes, byteorder='big')+timeoffset
+            mybytes = f.read(4)
+            modification_time = int.from_bytes(mybytes, byteorder='big')+timeoffset
+            mybytes = f.read(4)
+            timescale = int.from_bytes(mybytes, byteorder='big')
+            mybytes = f.read(4)
+            duration = int.from_bytes(mybytes, byteorder='big')/timescale
+            mvhd_remaining -= 16
+        else:
+            mybytes = f.read(8)
+            creation_time = int.from_bytes(mybytes, byteorder='big')+timeoffset
+            mybytes = f.read(8)
+            modification_time = int.from_bytes(mybytes, byteorder='big')+timeoffset
+            mybytes = f.read(4)
+            timescale = int.from_bytes(mybytes, byteorder='big')
+            mybytes = f.read(8)
+            duration = int.from_bytes(mybytes, byteorder='big')/timescale
+            mvhd_remaining -= 28
+        creation_time = datetime.datetime.fromtimestamp(creation_time)
+        modification_time = datetime.datetime.fromtimestamp(modification_time)
+        print('  ctime: ', creation_time)
+        print('  mtime: ', modification_time)
+        print('  tscale:', timescale)
+        print('  dt:    ', duration)
+
+        rate = int.from_bytes(f.read(4), byteorder='big') / (2**16)
+        volume = int.from_bytes(f.read(2), byteorder='big') / (2**8)
+        resevered = int.from_bytes(f.read(2), byteorder='big')
+        resevered = int.from_bytes(f.read(8), byteorder='big')
+        matrix = [int.from_bytes(f.read(4), byteorder='big') / (2**16) for x in range(9)]
+        pre_defined = [int.from_bytes(f.read(4), byteorder='big') for x in range(6)]
+        next_track_ID = int.from_bytes(f.read(4), byteorder='big')
+        print('  rate:', rate)
+        print('  vol: ', volume)
+        print('  mat: ', matrix)
+        print('  nID: ', next_track_ID)
+        mvhd_remaining -= 4+2+2+8+4*9+4*6+4
+        if mvhd_remaining != 0:
+            print('wrong length of mvhd')
+        moov_remaining -= package_length
+
+        # udta -- skip content
+        mybytes = f.read(4)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+
+        name = f.read(4)
+        if name != b'udta':
+            print('Error: wrong type (not udta)')
+            sys.exit(1)
+        f.seek(package_length-8, 1)
+        moov_remaining -= package_length
+
+        # next box
+        mybytes = f.read(4)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+
+        name = f.read(4)
+        if name != b'iods':
+            print('Error: wrong type (not iods)')
+            sys.exit(1)
+        f.seek(package_length-8, 1)
+        moov_remaining -= package_length
+
+        # trak
+        mybytes = f.read(4)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+
+        name = f.read(4)
+        if name != b'trak':
+            print('Error: wrong type (not trak)')
+            sys.exit(1)
+        trak_remaining = package_length-8
+        trak_length = package_length
+
+        # tkhd
+        mybytes = f.read(4)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+
+        name = f.read(4)
+        if name != b'tkhd':
+            print('Error: wrong type (not tkhd)')
+            sys.exit(1)
+        tkhd_remaining = package_length-8
+
+        version = int.from_bytes(f.read(1), byteorder='big')
+        tkhd_remaining -= 1
+
+        flags = f.read(3)
+        tkhd_remaining -= 3
+
+        timeoffset = datetime.datetime(1904, 1, 1).timestamp()
+        if version == 0:
+            mybytes = f.read(4)
+            creation_time = int.from_bytes(mybytes, byteorder='big')+timeoffset
+            mybytes = f.read(4)
+            modification_time = int.from_bytes(mybytes, byteorder='big')+timeoffset
+            mybytes = f.read(4)
+            track_id = int.from_bytes(mybytes, byteorder='big')
+            mybytes = f.read(4)
+            reserved = int.from_bytes(mybytes, byteorder='big')
+            mybytes = f.read(4)
+            duration = int.from_bytes(mybytes, byteorder='big')/timescale
+            tkhd_remaining -= 20
+        else:
+            mybytes = f.read(8)
+            creation_time = int.from_bytes(mybytes, byteorder='big')+timeoffset
+            mybytes = f.read(8)
+            modification_time = int.from_bytes(mybytes, byteorder='big')+timeoffset
+            mybytes = f.read(4)
+            track_id = int.from_bytes(mybytes, byteorder='big')
+            mybytes = f.read(4)
+            reserved = int.from_bytes(mybytes, byteorder='big')
+            mybytes = f.read(8)
+            duration = int.from_bytes(mybytes, byteorder='big')/timescale
+            tkhd_remaining -= 32
+        creation_time = datetime.datetime.fromtimestamp(creation_time)
+        modification_time = datetime.datetime.fromtimestamp(modification_time)
+        print('  ctime: ', creation_time)
+        print('  mtime: ', modification_time)
+        print('  track_id:', track_id)
+        print('  dt:    ', duration)
+
+        reserved = int.from_bytes(f.read(8), byteorder='big')
+        layer = int.from_bytes(f.read(2), byteorder='big')
+        alternative_group = int.from_bytes(f.read(2), byteorder='big')
+        volume = int.from_bytes(f.read(2), byteorder='big') / (2**8)
+        resevered = int.from_bytes(f.read(2), byteorder='big')
+        matrix = [int.from_bytes(f.read(4), byteorder='big') / (2**16) for x in range(9)]
+        width = int.from_bytes(f.read(4), byteorder='big') / (2**16)
+        height = int.from_bytes(f.read(4), byteorder='big') / (2**16)
+        print('  layer:', layer)
+        print('  agr: ', alternative_group)
+        if volume == 0:
+            print('  type: video')
+        else:
+            print('  type: audio')
+        print('  mat: ', matrix)
+        print('  width: ', width)
+        print('  height: ', height)
+        tkhd_remaining -= 8+2+2+2+2+4*9+4+4
+        if tkhd_remaining != 0:
+            print('wrong length of tkhd')
+        trak_remaining -= package_length
+
+        # tref
+        mybytes = f.read(4)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+
+        name = f.read(4)
+        if name != b'tref':
+            print('Error: wrong type (not tref)')
+            sys.exit(1)
+        f.seek(package_length-8, 1)
+        trak_remaining -= package_length
+
+        # edts
+        mybytes = f.read(4)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+
+        name = f.read(4)
+        if name != b'edts':
+            print('Error: wrong type (not edts)')
+            sys.exit(1)
+        # f.seek(package_length-8, 1)
+        trak_remaining -= 8
+
+        # elst
+        mybytes = f.read(4)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+
+        name = f.read(4)
+        if name != b'elst':
+            print('Error: wrong type (not elst)')
+            sys.exit(1)
+        elst_remaining = package_length-8
+        version = int.from_bytes(f.read(1), byteorder='big')
+        elst_remaining -= 1
+
+        flags = f.read(3)
+        elst_remaining -= 3
+
+        mybytes = f.read(4)
+        entry_count = int.from_bytes(mybytes, byteorder='big')
+        elst_remaining -= 4
+
+        for i in range(entry_count):
+            if version == 1:
+                segment_duration = int.from_bytes(f.read(8), byteorder='big')
+                media_time = int.from_bytes(f.read(8), byteorder='big')
+                elst_remaining -= 16
+            else:
+                segment_duration = int.from_bytes(f.read(4), byteorder='big')
+                media_time = int.from_bytes(f.read(4), byteorder='big')
+                elst_remaining -= 8
+            media_time_integer = int.from_bytes(f.read(2), byteorder='big')
+            media_time_fraction = int.from_bytes(f.read(2), byteorder='big')
+            elst_remaining -= 4
+        if elst_remaining != 0:
+            print('wrong length of elst')
+        trak_remaining -= package_length
+
+        # mdia
+        mybytes = f.read(4)
+        package_length = int.from_bytes(mybytes, byteorder='big')
+
+        name = f.read(4)
+        if name != b'mdia':
+            print('Error: wrong type (not mdia)')
+            sys.exit(1)
+        print(name, package_length)
+
+        trak_remaining -= package_length
+        print('trak remaining', trak_remaining)
+
+        moov_remaining -= trak_length
+        print('moov remaining', moov_remaining)
