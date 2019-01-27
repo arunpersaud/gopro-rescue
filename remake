@@ -24,6 +24,7 @@ header2 = data['header2']
 used = data['used']
 
 cluster_size = 256*512
+zero_cluster = b'\00'*cluster_size
 
 with open(imagefile, 'rb') as f:
     f.seek(cluster_size*start)
@@ -36,9 +37,9 @@ if commands['--invert']:
     outfile = 'reconstructed01-new.MP4'
 
 
-mdat1 = int.from_bytes(mybytes[20:24], byteorder='big') // cluster_size
-mdat2 = int.from_bytes(mybytes[header2*cluster_size+20:header2
-                               * cluster_size+24], byteorder='big') // cluster_size
+mdat1 = (20+int.from_bytes(mybytes[20:24], byteorder='big')) // cluster_size
+mdat2 = (20+int.from_bytes(mybytes[header2*cluster_size+20:header2
+                                   * cluster_size+24], byteorder='big')) // cluster_size
 
 
 def make_video(used):
@@ -59,7 +60,7 @@ def make_video(used):
                 for j in range(mdat2-c):
                     print('padded with zeros')
                     out2.write(zero_cluster)
-                out2.write(mybytes[i*cluster_size:(i+2)*cluster_size])
+                out2.write(mybytes[i*cluster_size:(i+1)*cluster_size])
     return c
 
 
