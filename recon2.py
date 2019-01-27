@@ -1,6 +1,8 @@
 """
-Usage: recon1.py <start> <stop>
+Usage: recon1.py [options] <start> <stop>
 
+Options:
+  --used <file>  use this json file for reconstruction
 """
 
 
@@ -22,10 +24,13 @@ commands = docopt(__doc__)
 # print(commands)
 # sys.exit(1)
 
+sdimage = '/sdimage-p1.img'
+#sdimage = 'subimage.bin'
+
 
 def save_used(used, filename='used.json'):
     """Save all information used to reconstruct movie"""
-    data = {'image': '/sdimage-p1.img', 'start': start,
+    data = {'image': sdimage, 'start': start,
             'header2': header2, 'stop': stop, 'used': [int(x) for x in used]}
     with open(filename, 'w') as f:
         json.dump(data, f)
@@ -38,7 +43,7 @@ def save_used(used, filename='used.json'):
 start = int(commands['<start>'])
 stop = int(commands['<stop>'])
 
-with open('/sdimage-p1.img', 'rb') as f:
+with open(sdimage, 'rb') as f:
     f.seek(cluster_size*start)
     mybytes = f.read((stop-start)*cluster_size)
 
@@ -47,7 +52,7 @@ zero_cluster = b'\x00'*cluster_size
 
 # find headers
 header1 = 0
-assert mybytes[:len(header)] == header, 'Wrong first header'
+#assert mybytes[:len(header)] == header, 'Wrong first header'
 
 header2 = mybytes.find(header, cluster_size) // cluster_size
 # should be at beginning of cluster
@@ -66,21 +71,27 @@ mdat2_cluster_length = (mdat2_length+20) // cluster_size
 print('mdat cluster lengths:', mdat1_cluster_length, mdat2_cluster_length)
 
 # find moov+mvhd positions that fits with mdat
+# most movies had 5 traks
 subsections = [b'mvhd', b'udta', b'iods', b'trak', b'trak', b'trak', b'trak', b'trak']
+# some timelapse movies don't have sound, so they only use 4 traks
+# comment the next line out for all other movies
+subsections = [b'mvhd', b'udta', b'iods', b'trak', b'trak', b'trak', b'trak']
 
 
 def find_moov(mdat_length, ignore=None):
     offset = (mdat_length + 20 + 4) % cluster_size
+    print(f'moov offset at: {offset}')
     if offset >= cluster_size - 4:
         print('Error: moov at end of cluster')
         sys.exit(1)
     moov = []
-    for i in range(stop-start):
+    for i in range(stop-start+1):
         if mybytes[i*cluster_size+offset:i*cluster_size+4+offset] == b'moov':
+            print(f'found moov at {i}')
             if not moov:
                 moov.append(i)
                 break
-    assert len(moov) == 1, 'Could not find a moov'
+    assert len(moov) >= 1, 'Could not find a moov'
     offset = (mdat_length + 20) % cluster_size
     moov_offset = offset
     moov_length = int.from_bytes(mybytes[offset+i*cluster_size:offset+4+i*cluster_size], byteorder='big')
@@ -103,7 +114,7 @@ def find_moov(mdat_length, ignore=None):
             for m in moov:
                 tmp += mybytes[m*cluster_size:(m+1)*cluster_size]
             sec_length = int.from_bytes(tmp[pos-4-cluster_size:pos-cluster_size], byteorder='big')
-            assert tmp[pos-cluster_size:pos+4-cluster_size] == sec, 'incorrect section'
+            assert tmp[pos-cluster_size:pos+4-cluster_size] == sec, f'incorrect section {sec}'
             pos = (pos+sec_length) % cluster_size
             # print(f'found sec with length {sec_length}, next pos {pos}')
         # ensure all of moov in tmp
@@ -113,9 +124,10 @@ def find_moov(mdat_length, ignore=None):
     return moov, moov_length
 
 
-moov1, moov1_length = find_moov(mdat1_length, [])
+#moov1, moov1_length = find_moov(mdat1_length, [])
+moov1 = []
 print('moov1:', moov1)
-print('moov1 length', moov1_length)
+#print('moov1 length', moov1_length)
 moov2, moov2_length = find_moov(mdat2_length, ignore=moov1)
 print('moov2:', moov2)
 print('moov2 length', moov2_length)
@@ -123,7 +135,21 @@ print('moov2 length', moov2_length)
 # create array to mark which blocks have been used
 # and write initial video out
 
-used = np.array([0] * (len(mybytes)//cluster_size+20))
+if commands['--used'] is not None:
+    with open(commands['--used'], 'r') as f:
+        data = json.load(f)
+    used = data['used']
+    moov1 = []
+    moov2 = []
+    for i, v in enumerate(used):
+        if v == -2:
+            moov1.append(i)
+        elif v == 2:
+            moov2.append(i)
+    print(f' read moov1 {moov1}, moov2 {moov2}')
+    used = np.asarray(used)
+else:
+    used = np.array([0] * (len(mybytes)//cluster_size+20))
 
 with open('reconstructed01.MP4', 'wb') as out1:
     out1.write(mybytes[:header2*cluster_size])
@@ -147,35 +173,42 @@ with open('reconstructed01.LRV', 'wb') as out2:
         out2.write(mybytes[m*cluster_size:(m+1)*cluster_size])
         used[m] = 2
 
-# read video index
-out = subprocess.run(['/home/arun/src/Prog/Bento4/cmakebuild/mp4iframeindex',
-                      'reconstructed01.LRV'], stdout=subprocess.PIPE)
-idx = json.loads(out.stdout)
+save_used(used, 'used-orig.json')
 
+try:
+    # read video index
+    out = subprocess.run(['/home/arun/src/Prog/Bento4/cmakebuild/mp4iframeindex',
+                          'reconstructed01.LRV'], stdout=subprocess.PIPE)
+    idx = json.loads(out.stdout)
+except json.decoder.JSONDecodeError:
+    print('LRV file cannot be parsed')
+    sys.exit(2)
 LRV_old = Path('reconstructed01.LRV_orig')
 LRV = Path('reconstructed01.LRV')
 shutil.copyfile(LRV, LRV_old)
 
 out = Counter(used)
 
-save_used(used, 'used-orig.json')
-
+print('finding offset')
 # reconstr LRV
 tmp = mybytes[header2*cluster_size:(header2+1)*cluster_size]
 frame_header = b'\x00\x00\x00\x02\t\x10\x00\x00\x00'
-offsets = [i['offset'] for i in idx]
+offsets = [i['offset'] for i in idx[:-1]]
 n_old = 0
+
+print('finding clusters')
 
 
 def last_frame(b):
     for o in offsets:
-        if o+10 < len(b):
-            if tmp[o:o+len(frame_header)] == frame_header:
+        if o+len(frame_header) <= len(b):
+            if b[o:o+len(frame_header)] == frame_header:
                 #print(o, 'got it')
                 pass
             else:
                 return o
         else:
+            #print('not in current clusters', o, len(frame_header), len(b))
             return o
     return None
 
@@ -187,16 +220,28 @@ while True:
         break
 
     # find next cluster
+    #print(next_pos, last_cluster)
     for c in range(last_cluster+1, stop):
         cluster = mybytes[c*cluster_size: (c+1)*cluster_size]
         p = next_pos % cluster_size
         if cluster[p:p+len(frame_header)] == frame_header:
+            #print('found cluster', c)
             tmp += cluster
             used[c] = 3
             last_cluster = c
             break
+        elif p > cluster_size - len(frame_header):
+            # the frame_header is at the end of the cluster overlapping with the next
+            # just try adding the current cluster and see if it works
+            test = tmp[-cluster_size:] + cluster
+            if test[p:p+len(frame_header)] == frame_header:
+                #print('found cluster', c)
+                tmp += cluster
+                used[c] = 3
+                last_cluster = c
+                break
     else:
-        print('no cluster found')
+        print(f'no cluster found for offset {p} {next_pos} last {last_cluster}')
 
 for i, u in enumerate(used):
     if u == 2:
